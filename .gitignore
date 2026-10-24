@@ -1,0 +1,15 @@
+# 打包产物
+*.zip
+*.tar.gz
+
+# 临时文件
+*.tmp
+*.swp
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 本地覆盖
+.env

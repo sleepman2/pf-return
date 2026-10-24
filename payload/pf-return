@@ -1,0 +1,228 @@
+#!/bin/bash
+# pf-return —— 端口白名单管理（交互式）
+# 用途：添加/删除需要「回包绕开旁路由，直接交给主路由」的端口
+# 支持 TCP / UDP
+set -u
+
+VERSION="1.1.0"
+
+if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then
+    echo "pf-return $VERSION"
+    exit 0
+fi
+
+ENV_FILE=${PF_RETURN_ENV:-/etc/pf-return/env}
+SYNC=${PF_RETURN_SYNC:-/usr/local/sbin/pf-return-sync.sh}
+
+if [ ! -r "$ENV_FILE" ]; then
+    echo "结果: 失败"
+    echo "原因: 找不到配置文件 $ENV_FILE"
+    exit 1
+fi
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+
+PORTS_FILE=${PORTS_FILE:-/etc/pf-return/ports.conf}
+LAN_CIDR=${LAN_CIDR:-192.168.1.0/24}
+MARK=${MARK:-0x1}
+COMMENT=${COMMENT:-pf-return}
+
+# ---------- 结果输出 ----------
+ok()  { echo; echo "结果: 成功"; [ -n "${1:-}" ] && echo "说明: $1"; }
+bad() { echo; echo "结果: 失败"; echo "原因: $1"; exit 1; }
+
+# ---------- 基础检查 ----------
+[ "$(id -u)" -eq 0 ]                 || bad "需要 root 权限，请用 sudo 运行"
+[ -x "$SYNC" ]                       || bad "找不到同步脚本 $SYNC"
+command -v iptables >/dev/null 2>&1  || bad "系统缺少 iptables 命令"
+touch "$PORTS_FILE" 2>/dev/null      || bad "无法写入白名单文件 $PORTS_FILE"
+
+# ---------- 白名单读写 ----------
+# 统一输出规范化的 "端口/协议"（bare 视为 tcp，both 展开成两条）
+list_entries() {
+    grep -vE '^[[:space:]]*(#|$)' "$PORTS_FILE" 2>/dev/null | tr -d ' \t\r' | while IFS= read -r e; do
+        case "$e" in
+            */*) p=${e%/*}; pr=${e#*/} ;;
+            *)   p=$e;       pr=tcp     ;;
+        esac
+        case "$p" in ''|*[!0-9]*) continue ;; esac
+        [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || continue
+        case "$pr" in
+            both) printf '%s/tcp\n%s/udp\n' "$p" "$p" ;;
+            tcp|udp) printf '%s/%s\n' "$p" "$pr" ;;
+        esac
+    done | sort -t/ -k1,1n -k2,2 -u
+}
+
+rewrite_entries() {
+    {
+        echo "# pf-return 端口白名单：<端口>/<tcp|udp>，一行一条，# 开头为注释"
+        cat
+    } >"$PORTS_FILE.tmp" && mv "$PORTS_FILE.tmp" "$PORTS_FILE" || bad "写入白名单文件失败"
+}
+
+entry_exists() { list_entries | grep -qx -- "$1"; }
+
+rule_exists() {
+    local p=$1 proto=$2
+    iptables -t mangle -C OUTPUT -p "$proto" -m "$proto" --sport "$p" \
+        ! -d "$LAN_CIDR" -m comment --comment "$COMMENT" \
+        -j MARK --set-xmark "${MARK}/0xffffffff" >/dev/null 2>&1
+}
+
+show_ports() {
+    local list
+    list=$(list_entries | tr '\n' ' ' | sed 's/ $//')
+    if [ -z "$list" ]; then echo "  （白名单为空）"; else echo "  $list"; fi
+}
+
+# ---------- 校验 ----------
+check_port() {
+    local p=$1
+    [[ "$p" =~ ^[0-9]+$ ]] || { echo "端口 \"$p\" 不是合法数字"; return 1; }
+    [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || { echo "端口 $p 超出范围（1-65535）"; return 1; }
+    return 0
+}
+
+# 解析输入项：53/udp -> "53 udp"；53 -> "53 "（协议留空表示用默认值）
+parse_token() {
+    local t=$1
+    case "$t" in
+        */*) printf '%s %s\n' "${t%/*}" "${t#*/}" ;;
+        *)   printf '%s \n' "$t" ;;
+    esac
+}
+
+expand_proto() {
+    case "$1" in
+        both) printf 'tcp\nudp\n' ;;
+        tcp|udp) printf '%s\n' "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+# 支持 8080 / 8080,3306 / "8080 3306"
+parse_ports() { echo "$1" | tr ',，;；' '    ' | tr -s ' '; }
+
+run_sync() {
+    local out
+    if ! out=$("$SYNC" 2>&1); then
+        bad "规则下发失败：$(echo "$out" | tr '\n' ' ')"
+    fi
+}
+
+# ---------- 菜单 ----------
+menu() {
+    echo
+    echo "================ 端口白名单管理 ================"
+    echo "当前白名单（端口/协议）:"
+    show_ports
+    echo "-----------------------------------------------"
+    echo "  1) 添加端口"
+    echo "  2) 删除端口"
+    echo "  3) 查看白名单"
+    echo "  0) 退出"
+    echo "==============================================="
+}
+
+do_add() {
+    local input proto token p pr prr added="" failed=0
+    local -a new_entries=()
+
+    read -r -p "请输入端口号（多个用逗号分隔，可写 53/udp）: " input
+    [ -z "${input// /}" ] && bad "输入为空"
+
+    read -r -p "协议 [tcp/udp/both]（默认 tcp）: " proto
+    proto=${proto:-tcp}
+    case "$proto" in tcp|udp|both) ;; *) bad "协议 \"$proto\" 无效，只能是 tcp / udp / both" ;; esac
+
+    for token in $(parse_ports "$input"); do
+        p=$(parse_token "$token" | awk '{print $1}')
+        pr=$(parse_token "$token" | awk '{print $2}')
+        [ -z "$pr" ] && pr="$proto"
+
+        if ! msg=$(check_port "$p"); then bad "$msg"; fi
+        if ! expand_proto "$pr" >/dev/null; then bad "协议 \"$pr\" 无效，只能是 tcp / udp / both"; fi
+
+        for prr in $(expand_proto "$pr"); do
+            if entry_exists "$p/$prr"; then
+                bad "端口 $p/$prr 已在白名单中（当前: $(list_entries | tr '\n' ' ' | sed 's/ $//')）"
+            fi
+            new_entries+=("$p/$prr")
+            added="$added $p/$prr"
+        done
+    done
+
+    { list_entries; printf '%s\n' "${new_entries[@]}"; } | rewrite_entries
+    run_sync
+
+    for e in "${new_entries[@]}"; do
+        if ! rule_exists "${e%/*}" "${e#*/}"; then
+            failed=1; break
+        fi
+    done
+    [ $failed -eq 1 ] && bad "iptables 规则校验未通过（$e 未生效，请检查 $PORTS_FILE 与同步脚本）"
+
+    ok "已添加$added，当前白名单: $(list_entries | tr '\n' ' ' | sed 's/ $//')"
+}
+
+do_del() {
+    local input token p pr removed=""
+    local -a to_del=()
+
+    read -r -p "请输入要删除的端口（多个用逗号分隔，可写 53/udp）: " input
+    [ -z "${input// /}" ] && bad "输入为空"
+
+    for token in $(parse_ports "$input"); do
+        p=$(parse_token "$token" | awk '{print $1}')
+        pr=$(parse_token "$token" | awk '{print $2}')
+
+        if ! msg=$(check_port "$p"); then bad "$msg"; fi
+
+        if [ -n "$pr" ]; then
+            case "$pr" in tcp|udp) ;; *) bad "协议 \"$pr\" 无效，只能是 tcp / udp" ;; esac
+            entry_exists "$p/$pr" || bad "端口 $p/$pr 不在白名单中（当前: $(list_entries | tr '\n' ' ' | sed 's/ $//')）"
+            to_del+=("$p/$pr")
+        else
+            local matches
+            matches=$(list_entries | grep -E "^${p}/(tcp|udp)$")
+            [ -z "$matches" ] && bad "端口 $p 不在白名单中（当前: $(list_entries | tr '\n' ' ' | sed 's/ $//')）"
+            while IFS= read -r m; do to_del+=("$m"); done <<<"$matches"
+        fi
+    done
+
+    removed=$(printf '%s\n' "${to_del[@]}" | tr '\n' ' ' | sed 's/ $//')
+    list_entries | grep -vxF -f <(printf '%s\n' "${to_del[@]}") | rewrite_entries
+    run_sync
+
+    for e in "${to_del[@]}"; do
+        if rule_exists "${e%/*}" "${e#*/}"; then
+            bad "端口 $e 的规则未能移除（iptables 可能被其他程序重写）"
+        fi
+    done
+
+    ok "已删除 $removed，当前白名单: $(list_entries | tr '\n' ' ' | sed 's/ $//')"
+}
+
+# 非交互参数：-l 查看 / -s 仅同步
+case "${1:-}" in
+    -l|--list) show_ports; exit 0 ;;
+    -s|--sync) "$SYNC"; exit $? ;;
+esac
+
+main() {
+    local choice
+    while true; do
+        menu
+        read -r -p "请选择操作 [0-3]: " choice
+        case "$choice" in
+            1) do_add ;;
+            2) do_del ;;
+            3) echo; show_ports ;;
+            0|q|Q|"") echo "已退出"; exit 0 ;;
+            *) echo; echo "无效选择: $choice" ;;
+        esac
+    done
+}
+
+main

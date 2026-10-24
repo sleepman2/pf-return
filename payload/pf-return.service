@@ -1,0 +1,12 @@
+[Unit]
+Description=Port whitelist return-path routing (bypass sidecar router)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pf-return-sync.sh
+
+[Install]
+WantedBy=multi-user.target
