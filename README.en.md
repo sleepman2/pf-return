@@ -135,25 +135,65 @@ sudo pf-return
 ```
 
 ```
-================ Port Whitelist ================
-Current (port/proto):
+================ Port Whitelist Manager ================
+Current whitelist (port/proto):
   8080/tcp
 -----------------------------------------------
-  1) Add port
+  1) Add port (pick from listening ports)
   2) Remove port
   3) Show whitelist
+  4) Switch language / 切换语言
   0) Exit
 ===============================================
-Select [0-3]: 1
-Ports (comma separated, e.g. 53/udp): 8901
-Protocol [tcp/udp/both] (default tcp): tcp
+Select [0-4]: 1
 
-Result: success
-Added 8901/tcp, whitelist: 8080/tcp 8901/tcp
+  Listening ports on this host:
+  #    PORT  PROTO ADDRESS                  PROCESS          NOTE
+  1    8080  tcp   *,[::]                   nginx            [already added]
+  2    3306  tcp   *                        mysqld
+  3    323   udp   127.0.0.1,[::1]          chronyd          [loopback only]
+  4    53    udp   *,[::]                   dnsmasq
+
+Select number(s) (e.g. 1,3) or port (prefix manual input with p:, e.g. p:8080; 0 to go back): 2,4
+
+Result: SUCCESS
+Note: added 3306/tcp 53/udp, whitelist: 8080/tcp 3306/tcp 53/udp
 ```
 
+**Input syntax**
+
+| Input | Meaning |
+|---|---|
+| `2` | Pick item 2 from the list |
+| `2,4` or `2 4` | Multiple selections |
+| `p:9000` | Manual port (protocol is asked next) |
+| `53/udp` | Manual port with explicit protocol |
+| `0` | Back to main menu |
+
+> A bare number is treated as a **list index** first; it is interpreted as a port only when it exceeds the number of list entries. Use the `p:` prefix if your port happens to fall inside that range.
+
+**NOTE column**
+
+| Flag | Meaning |
+|---|---|
+| `[already added]` | Port is already whitelisted; selecting it again is an error |
+| `[loopback only]` | Bound to `127.0.0.1` / `::1` only — port forwarding will not reach it |
+
+When **removing**, the whitelist is listed with each entry marked `listening` / `not listening` plus its process, which makes stale entries easy to spot.
+
+### UI language
+
+Defaults to the system locale: `zh*` or C/POSIX gives Chinese, anything else gives English. Three ways to switch:
+
+| Method | Scope |
+|---|---|
+| `pf-return --lang en` | this run only |
+| `PF_RETURN_LANG=en pf-return` | this run only (env var) |
+| Press `4` in the menu | writes `UI_LANG` into `/etc/pf-return/env` — **persistent** |
+
+Precedence: `--lang` > `PF_RETURN_LANG` > `UI_LANG` (config file) > system locale.
+
 - Changes take effect immediately, no restart required
-- Batch input: `8901,3306` or `8901 3306`
 - Protocol suffix: `53/udp`, `6000/both` (both = one TCP + one UDP rule)
 - Removing a bare port (e.g. `6000`) removes both its TCP and UDP entries
 - On failure the script prints `Result: failure` and the reason, exit code `1`
@@ -163,7 +203,9 @@ Added 8901/tcp, whitelist: 8080/tcp 8901/tcp
 ```sh
 pf-return -l         # show whitelist
 pf-return -s         # re-apply rules
-pf-return --version  # version
+pf-return --lang en  # English UI (this run only)
+pf-return -V         # version
+pf-return -h         # help
 ```
 
 ### Whitelist the **local service port**, not the external port

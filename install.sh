@@ -3,7 +3,7 @@
 # 用法: sudo ./install.sh [选项]
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PAYLOAD="$SCRIPT_DIR/payload"
 
@@ -186,6 +186,9 @@ ln -sf "$BIN_DIR/pf-return" "$SYMLINK"
 
 c_info "写入配置到 $CONF_DIR"
 mkdir -p "$CONF_DIR"
+# 升级时保留原有的界面语言设置
+OLD_UI_LANG=""
+[ -r "$CONF_DIR/env" ] && OLD_UI_LANG=$(grep -E '^UI_LANG=' "$CONF_DIR/env" 2>/dev/null | head -1 | cut -d= -f2-)
 cat >"$CONF_DIR/env" <<EOF
 # pf-return 配置文件（由 install.sh 生成于 $(date '+%Y-%m-%d %H:%M:%S')）
 GATEWAY=$GATEWAY
@@ -195,6 +198,8 @@ MARK=0x1
 LAN_CIDR=$LAN_CIDR
 PORTS_FILE=$CONF_DIR/ports.conf
 COMMENT=pf-return
+# 界面语言：zh / en，留空则跟随系统 locale
+UI_LANG=${OLD_UI_LANG:-}
 EOF
 
 # 已存在白名单则保留，否则写入初始值
